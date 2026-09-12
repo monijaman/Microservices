@@ -1,0 +1,8 @@
+# Compiled binaries from `go build` without -o
+*.exe
+services/*/order-service
+services/*/inventory-service
+services/*/payment-service
+
+# Local overrides
+docker-compose.override.yml
