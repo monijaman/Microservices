@@ -102,3 +102,29 @@ does **not** yet implement:
 
 Add these one at a time as you work through the guide — the code here is
 deliberately small so each addition is easy to see the effect of.
+
+##
+
+# 1. Build and start everything (Kafka, Kafka UI, Postgres, Redis, and the 3 Go services)
+docker compose up -d --build
+
+# 2. Wait ~15-30s for Kafka + consumer groups to settle, then create an order
+curl -X POST http://localhost:8081/orders `
+  -H "Content-Type: application/json" `
+  -d '{"item": "widget", "quantity": 2}'
+
+# 3. Check its status (replace <id> with the id from the response above)
+curl http://localhost:8081/orders/<id>
+
+# 4. Watch the services react live
+docker compose logs -f order-service inventory-service payment-service
+
+# 5. Inspect the data directly
+docker compose exec postgres psql -U appuser -d orderdb -c "select * from orders;"
+
+# 6. Kafka UI in the browser
+start http://localhost:8080
+
+# Shut everything down when done
+docker compose down
+
