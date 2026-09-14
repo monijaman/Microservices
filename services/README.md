@@ -109,8 +109,8 @@ deliberately small so each addition is easy to see the effect of.
 docker compose up -d --build
 
 # 2. Wait ~15-30s for Kafka + consumer groups to settle, then create an order
-curl -X POST http://localhost:8081/orders `
-  -H "Content-Type: application/json" `
+curl -X POST http://localhost:8081/orders \
+  -H "Content-Type: application/json" \
   -d '{"item": "widget", "quantity": 2}'
 
 # 3. Check its status (replace <id> with the id from the response above)
