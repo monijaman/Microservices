@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"time"
@@ -70,29 +70,64 @@ func newReader(broker, topic, groupID string) *kafka.Reader {
 	})
 }
 
-// readEvent blocks until the next message arrives, decodes it as an Event,
-// and returns it. Returning ok=false means "something went wrong, but keep
-// the consumer loop running" (e.g. malformed JSON from a bad producer) —
-// we log and move on rather than crashing the whole service over one bad
-// message.
+// ensureTopics makes sure every topic exists with at least topicPartitions
+// partitions. Left to Kafka's auto-create, a topic gets just 1 partition,
+// which means kafka.Hash has only one lane to choose from and a consumer
+// group can never have more than one active reader.
 //
-// Committing the Kafka offset happens automatically as part of FetchMessage
-// + ReadMessage in kafka-go's default mode: by the time this function
-// returns, the message is considered "processed". That's an "at-most-once
-// per crash" trade-off; see section 11 (Idempotency) and section 28
-// (Delivery Semantics) for why real systems need an idempotent-consumer
-// safety net on top of this.
-func readEvent(reader *kafka.Reader) (Event, bool) {
-	msg, err := reader.ReadMessage(context.Background())
+// It's safe to call on every startup and from every service at once:
+// "already exists" is ignored, and partitions are only ever added, never
+// removed (Kafka doesn't allow shrinking a topic).
+func ensureTopics(broker string, topics ...string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := &kafka.Client{Addr: kafka.TCP(broker)}
+
+	configs := make([]kafka.TopicConfig, len(topics))
+	for i, topic := range topics {
+		configs[i] = kafka.TopicConfig{
+			Topic:             topic,
+			NumPartitions:     topicPartitions,
+			ReplicationFactor: 1, // single-node dev cluster
+		}
+	}
+	created, err := client.CreateTopics(ctx, &kafka.CreateTopicsRequest{Topics: configs})
 	if err != nil {
-		log.Printf("kafka read error on topic %s: %v", reader.Config().Topic, err)
-		return Event{}, false
+		log.Fatalf("create topics: %v", err)
+	}
+	for topic, err := range created.Errors {
+		if err != nil && !errors.Is(err, kafka.TopicAlreadyExists) {
+			log.Fatalf("create topic %s: %v", topic, err)
+		}
 	}
 
-	var event Event
-	if err := json.Unmarshal(msg.Value, &event); err != nil {
-		log.Printf("failed to decode event from topic %s: %v", reader.Config().Topic, err)
-		return Event{}, false
+	// A topic that already existed (e.g. auto-created earlier with 1
+	// partition) keeps its old count, so grow it to the target.
+	meta, err := client.Metadata(ctx, &kafka.MetadataRequest{Topics: topics})
+	if err != nil {
+		log.Fatalf("read topic metadata: %v", err)
 	}
-	return event, true
+	var grow []kafka.TopicPartitionsConfig
+	for _, t := range meta.Topics {
+		if len(t.Partitions) < topicPartitions {
+			grow = append(grow, kafka.TopicPartitionsConfig{Name: t.Name, Count: topicPartitions})
+		}
+	}
+	if len(grow) == 0 {
+		return
+	}
+	res, err := client.CreatePartitions(ctx, &kafka.CreatePartitionsRequest{Topics: grow})
+	if err != nil {
+		log.Fatalf("add partitions: %v", err)
+	}
+	for topic, err := range res.Errors {
+		// InvalidPartitionNumber here means another service grew the
+		// topic between our Metadata call and this one — that's fine.
+		if err != nil && !errors.Is(err, kafka.InvalidPartitionNumber) {
+			log.Fatalf("add partitions to %s: %v", topic, err)
+		}
+		if err == nil {
+			log.Printf("topic %s grown to %d partitions", topic, topicPartitions)
+		}
+	}
 }

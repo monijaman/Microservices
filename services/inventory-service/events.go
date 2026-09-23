@@ -24,6 +24,12 @@ const (
 	topicPaymentEvents   = "payment.events"
 )
 
+// Each topic gets this many partitions (see ensureTopics). Events are keyed
+// by order ID, so all events for one order still land on the same
+// partition and stay in order; different orders can be processed in
+// parallel by up to this many consumers per group.
+const topicPartitions = 3
+
 const (
 	eventOrderCreated               = "OrderCreated"
 	eventInventoryReserved          = "InventoryReserved"

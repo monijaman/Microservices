@@ -15,42 +15,54 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
-	"time"
 
-	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/segmentio/kafka-go"
 )
 
 type service struct {
-	db          *sql.DB
-	kafkaWriter *kafka.Writer
+	db *sql.DB
 }
+
+// Consumer group IDs. Each also names that consumer's dead-letter topic
+// (see dlqTopic).
+//
+// Note: the group IDs include the topic name. A Kafka consumer group's
+// partition assignment is computed per topic subscription, so two readers
+// in the same service that subscribe to *different* topics must NOT share
+// a group ID — if they did, Kafka would treat them as two members of one
+// group and split/confuse the assignment between them instead of giving
+// each reader all the partitions it needs.
+const (
+	groupOrderEvents   = "inventory-service-order-events"
+	groupPaymentEvents = "inventory-service-payment-events"
+)
 
 func main() {
 	dbURL := mustEnv("DATABASE_URL")
 	kafkaBroker := mustEnv("KAFKA_BROKER")
+	ensureTopics(kafkaBroker, topicOrderEvents, topicInventoryEvents, topicPaymentEvents,
+		dlqTopic(groupOrderEvents), dlqTopic(groupPaymentEvents))
 
 	db := connectWithRetry(dbURL)
 	defer db.Close()
 	mustMigrate(db)
+	migrateMessaging(db)
 
-	writer := &kafka.Writer{
-		Addr:                   kafka.TCP(kafkaBroker),
-		Balancer:               &kafka.Hash{},
-		AllowAutoTopicCreation: true,
-	}
+	writer := newWriter(kafkaBroker)
 	defer writer.Close()
 
-	svc := &service{db: db, kafkaWriter: writer}
+	svc := &service{db: db}
+
+	go runOutboxRelay(db, writer)
 
 	log.Println("inventory-service started, waiting for events...")
 
-	// consumePaymentEvents runs in the background; consumeOrderEvents runs
+	// The payment consumer runs in the background; the order consumer runs
 	// on the main goroutine so the process stays alive.
-	go svc.consumePaymentEvents(kafkaBroker)
-	svc.consumeOrderEvents(kafkaBroker)
+	go consume(db, writer, kafkaBroker, topicPaymentEvents, groupPaymentEvents, svc.handlePaymentEvent)
+	consume(db, writer, kafkaBroker, topicOrderEvents, groupOrderEvents, svc.handleOrderEvent)
 }
 
 func mustMigrate(db *sql.DB) {
@@ -78,54 +90,33 @@ func mustMigrate(db *sql.DB) {
 	}
 }
 
-// consumeOrderEvents is the main Saga step this service performs.
-func (s *service) consumeOrderEvents(broker string) {
-	// Note: the group ID includes the topic name. A Kafka consumer group's
-	// partition assignment is computed per topic subscription, so two
-	// readers in the same service that subscribe to *different* topics
-	// must NOT share a group ID — if they did, Kafka would treat them as
-	// two members of one group and split/confuse the assignment between
-	// them instead of giving each reader all the partitions it needs.
-	reader := newReader(broker, topicOrderEvents, "inventory-service-order-events")
-	defer reader.Close()
-
-	for {
-		event, ok := readEvent(reader)
-		if !ok {
-			continue
-		}
-		if event.EventType != eventOrderCreated {
-			continue
-		}
-
-		var p orderCreatedPayload
-		if err := json.Unmarshal(event.Payload, &p); err != nil {
-			log.Printf("bad OrderCreated payload: %v", err)
-			continue
-		}
-
-		s.tryReserve(p.OrderID, p.Item, p.Quantity)
+// handleOrderEvent is the main Saga step this service performs. Like all
+// handlers it runs inside a DB transaction opened by consume() (see
+// messaging.go): returning an error rolls it back and the event is retried,
+// then parked on the DLQ if it keeps failing.
+func (s *service) handleOrderEvent(ctx context.Context, tx *sql.Tx, event Event) error {
+	if event.EventType != eventOrderCreated {
+		return nil
 	}
+
+	var p orderCreatedPayload
+	if err := json.Unmarshal(event.Payload, &p); err != nil {
+		return permanent(fmt.Errorf("bad OrderCreated payload: %w", err))
+	}
+	return s.tryReserve(ctx, tx, p.OrderID, p.Item, p.Quantity)
 }
 
-// tryReserve attempts to reserve stock inside a single DB transaction.
-// "SELECT ... FOR UPDATE" locks the inventory row so that if two orders for
-// the same item arrive at (almost) the same time, they're checked and
-// decremented one after another instead of both reading the same "stock
-// available" number and overselling.
-func (s *service) tryReserve(orderID, item string, quantity int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("begin tx failed: %v", err)
-		return
-	}
-	defer tx.Rollback() // no-op if we already committed
-
+// tryReserve attempts to reserve stock inside tx. "SELECT ... FOR UPDATE"
+// locks the inventory row so that if two orders for the same item arrive
+// at (almost) the same time, they're checked and decremented one after
+// another instead of both reading the same "stock available" number and
+// overselling.
+//
+// The resulting event goes into the outbox in the same transaction, so the
+// stock change and the event announcing it are saved together or not at all.
+func (s *service) tryReserve(ctx context.Context, tx *sql.Tx, orderID, item string, quantity int) error {
 	var available int
-	err = tx.QueryRowContext(ctx,
+	err := tx.QueryRowContext(ctx,
 		`SELECT available_quantity FROM inventory WHERE item = $1 FOR UPDATE`,
 		item,
 	).Scan(&available)
@@ -135,140 +126,76 @@ func (s *service) tryReserve(orderID, item string, quantity int) {
 		if err == nil {
 			reason = "insufficient stock"
 		}
-		tx.Rollback()
-		s.publishReservationFailed(orderID, reason)
 		log.Printf("order %s: reservation FAILED (%s)", orderID, reason)
-		return
+		return enqueueEvent(ctx, tx, topicInventoryEvents, eventInventoryReservationFailed, orderID,
+			inventoryReservationFailedPayload{OrderID: orderID, Reason: reason})
 	}
 	if err != nil {
-		log.Printf("check stock failed: %v", err)
-		return
+		return fmt.Errorf("check stock: %w", err)
 	}
 
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE inventory SET available_quantity = available_quantity - $1 WHERE item = $2`,
 		quantity, item,
 	); err != nil {
-		log.Printf("decrement stock failed: %v", err)
-		return
+		return fmt.Errorf("decrement stock: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO reservations (order_id, item, quantity) VALUES ($1, $2, $3)`,
 		orderID, item, quantity,
 	); err != nil {
-		log.Printf("insert reservation failed: %v", err)
-		return
+		return fmt.Errorf("insert reservation: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("commit reservation failed: %v", err)
-		return
+	if err := enqueueEvent(ctx, tx, topicInventoryEvents, eventInventoryReserved, orderID,
+		inventoryReservedPayload{OrderID: orderID, Item: item, Quantity: quantity}); err != nil {
+		return err
 	}
 
-	s.publishReserved(orderID, item, quantity)
 	log.Printf("order %s: reserved %d x %s", orderID, quantity, item)
+	return nil
 }
 
-// consumePaymentEvents listens for PaymentFailed so it can undo a
+// handlePaymentEvent listens for PaymentFailed so it can undo a
 // reservation it made earlier — the Saga compensating action.
-func (s *service) consumePaymentEvents(broker string) {
-	reader := newReader(broker, topicPaymentEvents, "inventory-service-payment-events")
-	defer reader.Close()
-
-	for {
-		event, ok := readEvent(reader)
-		if !ok {
-			continue
-		}
-		if event.EventType != eventPaymentFailed {
-			continue
-		}
-
-		var p paymentFailedPayload
-		if err := json.Unmarshal(event.Payload, &p); err != nil {
-			log.Printf("bad PaymentFailed payload: %v", err)
-			continue
-		}
-		s.release(p.OrderID)
+func (s *service) handlePaymentEvent(ctx context.Context, tx *sql.Tx, event Event) error {
+	if event.EventType != eventPaymentFailed {
+		return nil
 	}
+
+	var p paymentFailedPayload
+	if err := json.Unmarshal(event.Payload, &p); err != nil {
+		return permanent(fmt.Errorf("bad PaymentFailed payload: %w", err))
+	}
+	return s.release(ctx, tx, p.OrderID)
 }
 
-func (s *service) release(orderID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("begin tx failed: %v", err)
-		return
-	}
-	defer tx.Rollback()
-
+func (s *service) release(ctx context.Context, tx *sql.Tx, orderID string) error {
 	var item string
 	var quantity int
-	err = tx.QueryRowContext(ctx,
+	err := tx.QueryRowContext(ctx,
 		`DELETE FROM reservations WHERE order_id = $1 RETURNING item, quantity`,
 		orderID,
 	).Scan(&item, &quantity)
 	if err == sql.ErrNoRows {
 		// Nothing was ever reserved for this order (e.g. the reservation
 		// itself had already failed earlier) — nothing to release.
-		return
+		return nil
 	}
 	if err != nil {
-		log.Printf("lookup reservation failed: %v", err)
-		return
+		return fmt.Errorf("lookup reservation: %w", err)
 	}
 
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE inventory SET available_quantity = available_quantity + $1 WHERE item = $2`,
 		quantity, item,
 	); err != nil {
-		log.Printf("restock failed: %v", err)
-		return
+		return fmt.Errorf("restock: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("commit release failed: %v", err)
-		return
+	if err := enqueueEvent(ctx, tx, topicInventoryEvents, eventInventoryReleased, orderID,
+		inventoryReleasedPayload{OrderID: orderID}); err != nil {
+		return err
 	}
 
-	s.publishReleased(orderID)
 	log.Printf("order %s: released %d x %s back to stock (payment failed)", orderID, quantity, item)
-}
-
-// --- Publishing helpers -----------------------------------------------
-
-func (s *service) publishReserved(orderID, item string, quantity int) {
-	payload, _ := json.Marshal(inventoryReservedPayload{OrderID: orderID, Item: item, Quantity: quantity})
-	s.publish(orderID, eventInventoryReserved, payload)
-}
-
-func (s *service) publishReservationFailed(orderID, reason string) {
-	payload, _ := json.Marshal(inventoryReservationFailedPayload{OrderID: orderID, Reason: reason})
-	s.publish(orderID, eventInventoryReservationFailed, payload)
-}
-
-func (s *service) publishReleased(orderID string) {
-	payload, _ := json.Marshal(inventoryReleasedPayload{OrderID: orderID})
-	s.publish(orderID, eventInventoryReleased, payload)
-}
-
-func (s *service) publish(orderID, eventType string, payload []byte) {
-	event := Event{
-		EventID:     uuid.NewString(),
-		EventType:   eventType,
-		AggregateID: orderID,
-		Timestamp:   time.Now().UTC(),
-		Payload:     payload,
-	}
-	body, _ := json.Marshal(event)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := s.kafkaWriter.WriteMessages(ctx, kafka.Message{
-		Topic: topicInventoryEvents,
-		Key:   []byte(orderID), // same key as OrderCreated -> same partition -> stays in order
-		Value: body,
-	}); err != nil {
-		log.Printf("failed to publish %s for order %s: %v", eventType, orderID, err)
-	}
+	return nil
 }

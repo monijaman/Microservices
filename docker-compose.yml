@@ -48,6 +48,10 @@ services:
       # usually turns this off so topics are created deliberately.
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    volumes:
+      # Keeps topics, messages and consumer offsets across
+      # `docker compose down` / `up`. Without it they're wiped every time.
+      - kafka_data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:29092", "--list"]
       interval: 5s
@@ -87,7 +91,7 @@ services:
       - pg_data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 15
@@ -160,3 +164,4 @@ services:
 
 volumes:
   pg_data:
+  kafka_data:

@@ -16,13 +16,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
-	"github.com/segmentio/kafka-go"
 )
 
 // Order mirrors one row of the "orders" table. It's also what we return
@@ -45,34 +45,44 @@ const (
 
 // server bundles the dependencies our HTTP handlers need.
 type server struct {
-	db          *sql.DB
-	kafkaWriter *kafka.Writer
+	db *sql.DB
 }
+
+// Consumer group IDs. Each also names that consumer's dead-letter topic
+// (see dlqTopic).
+const (
+	groupInventoryEvents = "order-service-inventory-events"
+	groupPaymentEvents   = "order-service-payment-events"
+)
 
 func main() {
 	dbURL := mustEnv("DATABASE_URL")
 	kafkaBroker := mustEnv("KAFKA_BROKER")
+	ensureTopics(kafkaBroker, topicOrderEvents, topicInventoryEvents, topicPaymentEvents,
+		dlqTopic(groupInventoryEvents), dlqTopic(groupPaymentEvents))
 	port := envOr("PORT", "8081")
 
 	db := connectWithRetry(dbURL)
 	defer db.Close()
 	mustMigrate(db)
+	migrateMessaging(db)
 
-	// A single Writer can be shared safely across goroutines/requests;
-	// kafka-go batches and load-balances writes across partitions for us.
-	writer := &kafka.Writer{
-		Addr:                   kafka.TCP(kafkaBroker),
-		Balancer:               &kafka.Hash{}, // same key -> same partition, see below
-		AllowAutoTopicCreation: true,
-	}
+	// A single Writer can be shared safely across goroutines; it's used by
+	// the outbox relay and for parking failed messages on a DLQ.
+	writer := newWriter(kafkaBroker)
 	defer writer.Close()
 
-	srv := &server{db: db, kafkaWriter: writer}
+	srv := &server{db: db}
+
+	go runOutboxRelay(db, writer)
 
 	// Two background consumers: this service reacts to what Inventory and
 	// Payment report back, so it needs to listen on both of their topics.
-	go srv.consumeInventoryEvents(kafkaBroker)
-	go srv.consumePaymentEvents(kafkaBroker)
+	// Note the group IDs include the topic name — see the comment in
+	// inventory-service/main.go's main for why two readers in one service
+	// can't share a group ID.
+	go consume(db, writer, kafkaBroker, topicInventoryEvents, groupInventoryEvents, srv.handleInventoryEvent)
+	go consume(db, writer, kafkaBroker, topicPaymentEvents, groupPaymentEvents, srv.handlePaymentEvent)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -123,41 +133,18 @@ func (s *server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		Status:   statusPending,
 	}
 
-	// Note: this is the "naive" approach the guide calls out in section 17
-	// (Transactional Outbox) — we write to Postgres and publish to Kafka as
-	// two separate steps, so it's possible for the DB write to succeed and
-	// the Kafka publish to fail (or vice versa). That's intentional for
-	// this first milestone; the Outbox exercise fixes it properly later.
-	_, err := s.db.Exec(
-		`INSERT INTO orders (id, item, quantity, status) VALUES ($1, $2, $3, $4)`,
-		order.ID, order.Item, order.Quantity, order.Status,
-	)
-	if err != nil {
-		log.Printf("insert order failed: %v", err)
+	// Transactional outbox (section 17): the order row and its OrderCreated
+	// event are saved in ONE transaction, so either both exist or neither
+	// does. The outbox relay publishes the event to Kafka afterwards and
+	// keeps retrying if Kafka is down, so the order can't get stuck PENDING
+	// because a publish was lost.
+	if err := s.createOrder(r.Context(), order); err != nil {
+		log.Printf("create order failed: %v", err)
 		http.Error(w, `{"error":"failed to save order"}`, http.StatusInternalServerError)
 		return
 	}
 
-	payload, _ := json.Marshal(orderCreatedPayload{
-		OrderID:  order.ID,
-		Item:     order.Item,
-		Quantity: order.Quantity,
-	})
-	event := Event{
-		EventID:     uuid.NewString(),
-		EventType:   eventOrderCreated,
-		AggregateID: order.ID,
-		Timestamp:   time.Now().UTC(),
-		Payload:     payload,
-	}
-	if err := s.publish(topicOrderEvents, order.ID, event); err != nil {
-		// The order already exists in Postgres but nobody will ever hear
-		// about it. In a real system this is exactly why the Outbox
-		// pattern exists. For now we just log it loudly.
-		log.Printf("WARNING: order %s saved but publishing OrderCreated failed: %v", order.ID, err)
-	}
-
-	log.Printf("order %s created (item=%s qty=%d) -> published OrderCreated", order.ID, order.Item, order.Quantity)
+	log.Printf("order %s created (item=%s qty=%d) -> OrderCreated queued in outbox", order.ID, order.Item, order.Quantity)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -186,104 +173,97 @@ func (s *server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(o)
 }
 
-// publish sends an event to Kafka using the AggregateID (the OrderID) as
-// the message key. Kafka guarantees that all messages with the same key
-// land on the same partition and stay in order *within that partition* —
-// so every event about order-123 is processed in the order it was
-// published, even though other orders' events may interleave with it on
-// other partitions. See section 10 of the guide.
-func (s *server) publish(topic, key string, event Event) error {
-	body, err := json.Marshal(event)
+func (s *server) createOrder(ctx context.Context, order Order) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return s.kafkaWriter.WriteMessages(ctx, kafka.Message{
-		Topic: topic,
-		Key:   []byte(key),
-		Value: body,
-	})
+	defer tx.Rollback() // no-op if we already committed
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO orders (id, item, quantity, status) VALUES ($1, $2, $3, $4)`,
+		order.ID, order.Item, order.Quantity, order.Status,
+	); err != nil {
+		return err
+	}
+	// The OrderID is the event's key: Kafka guarantees that all messages
+	// with the same key land on the same partition and stay in order
+	// *within that partition* — so every event about order-123 is processed
+	// in the order it was published, even though other orders' events may
+	// interleave with it on other partitions. See section 10 of the guide.
+	if err := enqueueEvent(ctx, tx, topicOrderEvents, eventOrderCreated, order.ID, orderCreatedPayload{
+		OrderID:  order.ID,
+		Item:     order.Item,
+		Quantity: order.Quantity,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// --- Kafka consumers -------------------------------------------------------
+// --- Kafka event handlers ----------------------------------------------------
+//
+// Each handler runs inside a DB transaction opened by consume() (see
+// messaging.go). Returning an error rolls it back and the event is retried,
+// then parked on the DLQ if it keeps failing.
 
-// consumeInventoryEvents reacts only to failures: if Inventory couldn't
+// handleInventoryEvent reacts only to failures: if Inventory couldn't
 // reserve stock, the order can never succeed, so we cancel it.
 // (InventoryReserved on its own doesn't complete the order — payment still
 // has to happen — so Order Service doesn't need to react to it.)
-func (s *server) consumeInventoryEvents(broker string) {
-	// Note: the group ID includes the topic name because this service also
-	// runs a second reader (consumePaymentEvents) on a different topic —
-	// see the comment in inventory-service/main.go's consumeOrderEvents
-	// for why they can't share a group ID.
-	reader := newReader(broker, topicInventoryEvents, "order-service-inventory-events")
-	defer reader.Close()
-
-	for {
-		event, ok := readEvent(reader)
-		if !ok {
-			continue
-		}
-
-		if event.EventType != eventInventoryReservationFailed {
-			continue
-		}
-
-		var p inventoryReservationFailedPayload
-		if err := json.Unmarshal(event.Payload, &p); err != nil {
-			log.Printf("bad InventoryReservationFailed payload: %v", err)
-			continue
-		}
-		s.updateStatus(p.OrderID, statusCancelled)
-		log.Printf("order %s CANCELLED (inventory reservation failed: %s)", p.OrderID, p.Reason)
+func (s *server) handleInventoryEvent(ctx context.Context, tx *sql.Tx, event Event) error {
+	if event.EventType != eventInventoryReservationFailed {
+		return nil
 	}
+
+	var p inventoryReservationFailedPayload
+	if err := json.Unmarshal(event.Payload, &p); err != nil {
+		return permanent(fmt.Errorf("bad InventoryReservationFailed payload: %w", err))
+	}
+	if err := updateStatus(ctx, tx, p.OrderID, statusCancelled); err != nil {
+		return err
+	}
+	log.Printf("order %s CANCELLED (inventory reservation failed: %s)", p.OrderID, p.Reason)
+	return nil
 }
 
-// consumePaymentEvents reacts to the final step of the happy path
+// handlePaymentEvent reacts to the final step of the happy path
 // (PaymentCompleted -> order is done) and to the failure path
 // (PaymentFailed -> order is cancelled). Note that Inventory Service is
 // *also* listening to payment.events directly, to release the stock it
 // reserved earlier — that's the Saga compensation step, and it happens
 // independently of what Order Service does here.
-func (s *server) consumePaymentEvents(broker string) {
-	reader := newReader(broker, topicPaymentEvents, "order-service-payment-events")
-	defer reader.Close()
-
-	for {
-		event, ok := readEvent(reader)
-		if !ok {
-			continue
+func (s *server) handlePaymentEvent(ctx context.Context, tx *sql.Tx, event Event) error {
+	switch event.EventType {
+	case eventPaymentCompleted:
+		var p paymentCompletedPayload
+		if err := json.Unmarshal(event.Payload, &p); err != nil {
+			return permanent(fmt.Errorf("bad PaymentCompleted payload: %w", err))
 		}
-
-		switch event.EventType {
-		case eventPaymentCompleted:
-			var p paymentCompletedPayload
-			if err := json.Unmarshal(event.Payload, &p); err != nil {
-				log.Printf("bad PaymentCompleted payload: %v", err)
-				continue
-			}
-			s.updateStatus(p.OrderID, statusCompleted)
-			log.Printf("order %s COMPLETED (payment %s succeeded)", p.OrderID, p.PaymentID)
-
-		case eventPaymentFailed:
-			var p paymentFailedPayload
-			if err := json.Unmarshal(event.Payload, &p); err != nil {
-				log.Printf("bad PaymentFailed payload: %v", err)
-				continue
-			}
-			s.updateStatus(p.OrderID, statusCancelled)
-			log.Printf("order %s CANCELLED (payment failed: %s)", p.OrderID, p.Reason)
+		if err := updateStatus(ctx, tx, p.OrderID, statusCompleted); err != nil {
+			return err
 		}
+		log.Printf("order %s COMPLETED (payment %s succeeded)", p.OrderID, p.PaymentID)
+
+	case eventPaymentFailed:
+		var p paymentFailedPayload
+		if err := json.Unmarshal(event.Payload, &p); err != nil {
+			return permanent(fmt.Errorf("bad PaymentFailed payload: %w", err))
+		}
+		if err := updateStatus(ctx, tx, p.OrderID, statusCancelled); err != nil {
+			return err
+		}
+		log.Printf("order %s CANCELLED (payment failed: %s)", p.OrderID, p.Reason)
 	}
+	return nil
 }
 
-func (s *server) updateStatus(orderID, status string) {
-	_, err := s.db.Exec(
+func updateStatus(ctx context.Context, tx *sql.Tx, orderID, status string) error {
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE orders SET status = $1, updated_at = now() WHERE id = $2`,
 		status, orderID,
-	)
-	if err != nil {
-		log.Printf("failed to update order %s to %s: %v", orderID, status, err)
+	); err != nil {
+		return fmt.Errorf("update order %s to %s: %w", orderID, status, err)
 	}
+	return nil
 }
