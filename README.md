@@ -31,11 +31,22 @@ For a detailed walkthrough of the code, how each pattern works, and step-by-step
                                  |  order.events  inventory.events       |
                                  |  payment.events   + one .dlq per group|
                                  +---------------------------------------+
+                                                   |
+                                                   | reads order.events + payment.events
+                                                   v
+                                    +-------------------------------------+
+                                    | Order Analytics (Kafka Streams :8082)|
+                                    | analytics.large-orders               |
+                                    | analytics.item-order-counts          |
+                                    | analytics.item-orders-per-minute     |
+                                    | analytics.paid-orders                |
+                                    +-------------------------------------+
 ```
 
 - The services **never call each other**. They only publish and consume Kafka events.
 - Each service owns **its own database** (database per service). The three databases share one Postgres container to keep the lab light.
 - The order flow is a **choreographed Saga**: each service reacts to events, and a failure triggers compensating actions (e.g. releasing reserved stock) instead of a distributed transaction.
+- **Order Analytics is read-only**: it consumes the business events and writes separate `analytics.*` topics. It never changes an order, inventory, or payment record. Its detailed guide is [here](kafka-streams/order-analytics/README.md).
 
 ## Prerequisites
 
@@ -71,6 +82,7 @@ Watch it happen live:
 
 - `docker compose logs -f order-service inventory-service payment-service` — see each service react to the Kafka events
 - http://localhost:8080 — Kafka UI, browse topics/messages/partitions/consumer groups
+- http://localhost:8082/counts — Kafka Streams' current per-item order counts; use `/counts/widget` for one item
 - `docker compose exec postgres psql -U appuser -d orderdb -c "select * from orders;"` — inspect the data directly
 
 Run the same POST a bunch of times — roughly 30% of orders will have their payment simulated-fail, which triggers the Saga's compensation path (inventory gets released, order gets cancelled). See [services/README.md](services/README.md) for exactly how that flow works.
@@ -86,6 +98,7 @@ Run the same POST a bunch of times — roughly 30% of orders will have their pay
 | `kafka-ui` | http://localhost:8080 | Web dashboard for topics, messages and consumer groups |
 | `postgres` | `localhost:5432` | Databases `orderdb`, `inventorydb`, `paymentdb`; user `appuser` / `apppass` |
 | `redis` | `localhost:6379` | Not used yet; ready for the caching / locking exercises |
+| `order-analytics` | http://localhost:8082 | Kafka Streams learning app; derives read-only analytics from the order and payment topics |
 
 Data is kept in two Docker volumes, `pg_data` and `kafka_data`, so it survives `docker compose down`. Use `docker compose down -v` to wipe it.
 
@@ -175,6 +188,16 @@ curl -s http://localhost:8081/orders/<id>     # "status":"COMPLETED" (or CANCELL
 
 To check that the Go code compiles without Docker, run `go vet .` in each service folder.
 
+The Streams topology has fast, isolated Java tests (no broker needed):
+
+```bash
+cd kafka-streams/order-analytics
+docker run --rm -v "$PWD":/src -v order-analytics-m2:/root/.m2 -w /src \
+  maven:3.9-eclipse-temurin-21 mvn -q test
+```
+
+For the exact expected output topics, reset procedure, and exercises, see the [Order Analytics README](kafka-streams/order-analytics/README.md).
+
 ## Project structure
 
 ```text
@@ -185,6 +208,8 @@ To check that the Go code compiles without Docker, run `go vet .` in each servic
 ├── .env                         <- Postgres login, PAYMENT_FAILURE_RATE
 ├── infra/
 │   └── postgres/init.sql        <- creates inventorydb and paymentdb
+├── kafka-streams/
+│   └── order-analytics/         <- Java Kafka Streams analytics lab and tests
 └── services/
     ├── README.md                <- detailed walkthrough, tests, troubleshooting
     ├── order-service/
@@ -246,6 +271,7 @@ Progress against the guide's exercises:
 | 14-15 | Saga choreography and compensation | Done |
 | 16 | Saga orchestration | Not yet |
 | 17 | Transactional outbox | Done |
-| 18+ | Kafka Streams, Schema Registry, Redis, API Gateway, auth, circuit breakers, observability | Not yet |
+| 18 | Kafka Streams | Done: Java app in [kafka-streams/order-analytics](kafka-streams/order-analytics/README.md) (filter, KTable count, windows, join, interactive queries) |
+| 19+ | Schema Registry, Redis, API Gateway, auth, circuit breakers, observability | Not yet |
 
 Keep extending this codebase one exercise at a time before moving into the Kubernetes exercises (section 34.5).

@@ -6,3 +6,6 @@ services/*/payment-service
 
 # Local overrides
 docker-compose.override.yml
+
+# Maven build output (Kafka Streams app)
+kafka-streams/*/target/

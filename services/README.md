@@ -197,8 +197,11 @@ consumer offsets survive `docker compose down` / `up`. Messages are kept for
 - **No cleanup.** `outbox` and `processed_events` grow forever. A real
   system deletes old published rows with a scheduled job.
 - **No automatic DLQ replay.** Replaying is manual (see below).
-- **Saga Orchestrator, Kafka Streams, Schema Registry, observability** are
-  later milestones in the guide.
+- **Saga Orchestrator, Schema Registry, and observability** are later
+  milestones in the guide. Kafka Streams is implemented separately as the
+  read-only [Order Analytics app](../kafka-streams/order-analytics/README.md);
+  it consumes this service layer's events but does not participate in the
+  Saga or write to these databases.
 
 ## Where to look for each Kafka concept
 
@@ -794,7 +797,7 @@ Tables each service owns:
 ## Command cheat sheet
 
 ```bash
-# Build and start everything (Kafka, Kafka UI, Postgres, Redis, and the 3 Go services)
+# Build and start everything (Kafka, Kafka UI, Postgres, Redis, the 3 Go services, and Order Analytics)
 docker compose up -d --build
 
 # Create an order
@@ -817,6 +820,9 @@ docker exec kafka kafka-consumer-groups --bootstrap-server kafka:29092 --describ
 
 # Kafka UI in the browser
 xdg-open http://localhost:8080
+
+# Kafka Streams interactive query: current order count per item
+curl http://localhost:8082/counts
 
 # Stop everything (data is kept)
 docker compose down

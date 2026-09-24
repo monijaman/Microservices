@@ -162,6 +162,25 @@ services:
       postgres:
         condition: service_healthy
 
+  # ---------------------------------------------------------------------------
+  # Order Analytics — a Kafka Streams (Java) app for practicing stream
+  # processing (MICROSERVICES_PRACTICE.md section 18). It reads order.events
+  # and payment.events and writes analytics.* topics: filters, per-item
+  # counts (KTable), 1-minute windows, and an order+payment join.
+  # Interactive queries: http://localhost:8082/counts
+  # See kafka-streams/order-analytics/README.md.
+  # ---------------------------------------------------------------------------
+  order-analytics:
+    build: ./kafka-streams/order-analytics
+    container_name: order-analytics
+    ports:
+      - "8082:8082"
+    environment:
+      KAFKA_BROKER: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
 volumes:
   pg_data:
   kafka_data:
